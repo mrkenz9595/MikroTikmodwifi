@@ -9,11 +9,6 @@ on:
         description: 'RouterOS 版本 (例如: 7.23)'
         required: true
         type: string
-      publish_to_vps:
-        description: '是否同步发布到升级服务器'
-        required: true
-        type: boolean
-        default: false
       channel:
         description: '更新频道'
         required: true
@@ -27,87 +22,15 @@ permissions:
   contents: write
 
 jobs:
-  check-updates:
-    name: 🔍 检查版本更新
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - name: 对比版本并生成构建矩阵
-        id: set-matrix
-        env:
-          SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
-          SSH_PORT: ${{ secrets.VPS_SSH_PORT || '22' }}
-          SSH_USER: ${{ secrets.VPS_SSH_USER }}
-          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-          WEB_DIR: ${{ secrets.VPS_WEB_DIR }}
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-              echo ">>> 检测到手动触发，使用指定的版本和频道..."
-              PUB_VPS="${{ inputs.publish_to_vps }}"
-              if [ "$PUB_VPS" == "true" ]; then IS_PUB="true"; else IS_PUB="false"; fi
-              JSON_ARRAY=$(jq -n -c \
-                --arg v "${{ inputs.version }}" \
-                --arg c "${{ inputs.channel }}" \
-                --argjson p "$IS_PUB" \
-                '[{version: $v, channel: $c, publish_to_vps: $p}]')
-              echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
-              exit 0
-          fi
-
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -p $SSH_PORT $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null
-
-          echo ">>> 开启自动巡检模式..."
-          JSON_ARRAY="[]"
-          
-          for channel in stable long-term; do
-              echo "-----------------------------------------------------"
-              echo "🔍 正在检查频道: $channel"
-              
-              OFFICIAL_NEWEST=$(curl -sLf "https://upgrade.mikrotik.com/routeros/NEWESTa7.$channel" || echo "")
-              OFFICIAL_VER=$(echo "$OFFICIAL_NEWEST" | awk '{print $1}')
-              
-              CUSTOM_NEWEST=$(ssh -p $SSH_PORT $SSH_USER@$SSH_HOST "cat $WEB_DIR/NEWESTa7.$channel 2>/dev/null" || echo "")
-              CUSTOM_VER=$(echo "$CUSTOM_NEWEST" | awk '{print $1}')
-              
-              if [[ ! "$OFFICIAL_VER" =~ ^[0-9] ]]; then OFFICIAL_VER=""; fi
-              if [[ ! "$CUSTOM_VER" =~ ^[0-9] ]]; then CUSTOM_VER=""; fi
-              
-              echo "   > 官方最新版 : ${OFFICIAL_VER:-'未获取到'}"
-              echo "   > VPS 当前版 : ${CUSTOM_VER:-'无记录'}"
-              
-              if [ -n "$OFFICIAL_VER" ]; then
-                  UPDATE=false
-                  if [ -z "$CUSTOM_VER" ]; then
-                      echo "   ✅ 准备首次发布该频道..."
-                      UPDATE=true
-                  elif [ "$OFFICIAL_VER" != "$CUSTOM_VER" ]; then
-                      NORM_OFFICIAL=$(echo "$OFFICIAL_VER" | sed -E 's/(beta|rc|alpha)/~\1/g')
-                      NORM_CUSTOM=$(echo "$CUSTOM_VER" | sed -E 's/(beta|rc|alpha)/~\1/g')
-                      if dpkg --compare-versions "$NORM_OFFICIAL" gt "$NORM_CUSTOM"; then 
-                          echo "   🚀 发现新版本！准备拉起更新流水线..."
-                          UPDATE=true
-                      fi
-                  fi
-                  if [ "$UPDATE" = true ]; then
-                      JSON_ARRAY=$(echo "$JSON_ARRAY" | jq -c --arg v "$OFFICIAL_VER" --arg c "$channel" '. += [{"version": $v, "channel": $c, "publish_to_vps": true}]')
-                  fi
-              fi
-          done
-          echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
   patch-and-pack:
     name: 📦 编译发布 (${{ matrix.build.channel }} - ${{ matrix.build.version }})
-    needs: check-updates
-    if: ${{ needs.check-updates.outputs.matrix != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        build: ${{ fromJson(needs.check-updates.outputs.matrix) }}
+        build:
+          - version: ${{ inputs.version }}
+            channel: ${{ inputs.channel }}
     
     env:
       VERSION: ${{ matrix.build.version }}
@@ -505,26 +428,26 @@ jobs:
 
           sudo rm -rf ./mihomo-root ./option-root ./chr_build
 
-      - name: 📤 整理与规范命名 (推向 VPS)
+      - name: 📤 整理与规范命名
         run: |
-          mkdir -p ./vps_upload/${VERSION}
-          mkdir -p ./vps_upload/extra/${VERSION}
+          mkdir -p ./release_files/${VERSION}
+          mkdir -p ./release_files/extra/${VERSION}
           
           # [处理 ARM64]
-          cp ./all_packages_arm64/*.npk ./vps_upload/${VERSION}/
-          if [ -f "./vps_upload/${VERSION}/wifi-qcom-${VERSION}-arm64-R.npk" ]; then
-              mv ./vps_upload/${VERSION}/wifi-qcom-${VERSION}-arm64-R.npk ./vps_upload/extra/${VERSION}/
+          cp ./all_packages_arm64/*.npk ./release_files/${VERSION}/
+          if [ -f "./release_files/${VERSION}/wifi-qcom-${VERSION}-arm64-R.npk" ]; then
+              mv ./release_files/${VERSION}/wifi-qcom-${VERSION}-arm64-R.npk ./release_files/extra/${VERSION}/
           fi
-          if [ -f "./vps_upload/${VERSION}/wifi-qcom-${VERSION}-arm64-X.npk" ]; then
-              mv ./vps_upload/${VERSION}/wifi-qcom-${VERSION}-arm64-X.npk ./vps_upload/${VERSION}/wifi-qcom-${VERSION}-arm64.npk
+          if [ -f "./release_files/${VERSION}/wifi-qcom-${VERSION}-arm64-X.npk" ]; then
+              mv ./release_files/${VERSION}/wifi-qcom-${VERSION}-arm64-X.npk ./release_files/${VERSION}/wifi-qcom-${VERSION}-arm64.npk
           fi
           
           # [处理 X86]
-          cp ./all_packages_x86/*.npk ./vps_upload/${VERSION}/
-          cp ./all_packages_x86/routeros-${VERSION}-x86.npk ./vps_upload/${VERSION}/routeros-${VERSION}.npk
-          rm -f ./vps_upload/${VERSION}/routeros-${VERSION}-x86*.npk
+          cp ./all_packages_x86/*.npk ./release_files/${VERSION}/
+          cp ./all_packages_x86/routeros-${VERSION}-x86.npk ./release_files/${VERSION}/routeros-${VERSION}.npk
+          rm -f ./release_files/${VERSION}/routeros-${VERSION}-x86*.npk
           
-          cd ./vps_upload/${VERSION}/
+          cd ./release_files/${VERSION}/
           for f in *-x86.npk; do
               if [ -f "$f" ]; then mv "$f" "${f%-x86.npk}.npk"; fi
           done
@@ -543,103 +466,14 @@ jobs:
           done
           cd ../../
           
-          cp output_images/*.zip ./vps_upload/extra/${VERSION}/
-          cp netinstall-${VERSION}.zip ./vps_upload/extra/${VERSION}/
-          cp changelog.txt ./vps_upload/${VERSION}/CHANGELOG
+          cp output_images/*.zip ./release_files/extra/${VERSION}/
+          cp netinstall-${VERSION}.zip ./release_files/extra/${VERSION}/
+          cp changelog.txt ./release_files/${VERSION}/CHANGELOG
           
-          cd ./vps_upload/${VERSION}/
+          cd ./release_files/${VERSION}/
           zip -q ../../all_packages_arm64_${VERSION}_patched.zip *arm64*.npk
           zip -q ../../all_packages_x86_${VERSION}_patched.zip *.npk -x "*arm64*"
           cd ../../
-
-      - name: 🚀 生成配置并发布到 VPS
-        if: ${{ matrix.build.publish_to_vps == true }}
-        env:
-          SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
-          SSH_PORT: ${{ secrets.VPS_SSH_PORT || '22' }}
-          SSH_USER: ${{ secrets.VPS_SSH_USER }}
-          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-          WEB_DIR: ${{ secrets.VPS_WEB_DIR }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -p $SSH_PORT $SSH_HOST >> ~/.ssh/known_hosts
-
-          REMOTE_NEWEST=$(ssh -p $SSH_PORT $SSH_USER@$SSH_HOST "cat $WEB_DIR/NEWESTa7.${CHANNEL} 2>/dev/null" || echo "")
-          REMOTE_VERSION=$(echo "$REMOTE_NEWEST" | awk '{print $1}')
-          
-          UPDATE_NEWEST=false
-          if [ -z "$REMOTE_VERSION" ]; then UPDATE_NEWEST=true
-          elif [ "$VERSION" != "$REMOTE_VERSION" ]; then
-              NORM_REMOTE=$(echo "$REMOTE_VERSION" | sed -E 's/(beta|rc|alpha)/~\1/g')
-              NORM_LOCAL=$(echo "$VERSION" | sed -E 's/(beta|rc|alpha)/~\1/g')
-              if dpkg --compare-versions "$NORM_LOCAL" gt "$NORM_REMOTE"; then UPDATE_NEWEST=true; fi
-          fi
-
-          if [ "$UPDATE_NEWEST" == "true" ]; then
-              echo "${VERSION} $(date +%s)" > ./vps_upload/NEWESTa7.${CHANNEL}
-          fi
-          
-          scp -P $SSH_PORT $SSH_USER@$SSH_HOST:$WEB_DIR/versions.json ./old_versions.json 2>/dev/null || echo "{}" > ./old_versions.json
-          export REMOTE_DIRS=$(ssh -p $SSH_PORT $SSH_USER@$SSH_HOST "cd $WEB_DIR && find . -maxdepth 1 -type d -name '7.*' | sed 's|./||'" || echo "")
-          
-          cat << 'EOF' > update_json.py
-          import json, subprocess, re, sys, os
-          version_to_add = sys.argv[1]
-          channel_to_add = sys.argv[2]
-          db = {"stable": [], "long-term": [], "testing": [], "development": []}
-          try:
-              with open('./old_versions.json', 'r') as f: data = json.load(f)
-              if isinstance(data, dict):
-                  for k in db.keys(): db[k] = data.get(k, [])
-          except Exception: pass
-          remote_dirs = os.environ.get("REMOTE_DIRS", "").split()
-          for v in remote_dirs:
-              v = v.strip()
-              if not v: continue
-              if not any(v in db[c] for c in db.keys()):
-                  if "rc" in v: db["testing"].append(v)
-                  elif "beta" in v: db["development"].append(v)
-                  elif v in ["7.20.8", "7.21.4"]: db["long-term"].append(v)
-                  else: db["stable"].append(v)
-          for k in db.keys():
-              if version_to_add in db[k]: db[k].remove(version_to_add)
-          db[channel_to_add].append(version_to_add)
-          def sort_versions(v_list):
-              if not v_list: return []
-              v_list = list(set(v_list))
-              norm_map = {re.sub(r'(beta|rc|alpha)', r'~\1', v): v for v in v_list}
-              p = subprocess.run(['sort', '-V', '-r'], input='\n'.join(norm_map.keys()), text=True, capture_output=True)
-              return [norm_map[n] for n in p.stdout.strip().split('\n') if n in norm_map]
-          for k in db.keys(): db[k] = sort_versions(db[k])
-          db["development"] = db["development"][:1]
-          db["testing"] = db["testing"][:1]
-          if db["stable"]:
-              majors = set()
-              for v in db["stable"]:
-                  m = re.match(r'^(\d+\.\d+)', v)
-                  if m: majors.add(m.group(1))
-              sorted_majors = sort_versions(list(majors))
-              allowed_majors = sorted_majors[:2]
-              db["stable"] = [v for v in db["stable"] if re.match(r'^(\d+\.\d+)', v) and re.match(r'^(\d+\.\d+)', v).group(1) in allowed_majors]
-          with open('./versions.json', 'w') as f: json.dump(db, f, indent=2)
-          keep_set = set(db["stable"] + db["long-term"]+ db["testing"] + db["development"])
-          keep_set.add(version_to_add)
-          to_delete = [v for v in remote_dirs if v.strip() and v.strip() not in keep_set]
-          with open('./delete_list.txt', 'w') as f: f.write('\n'.join(to_delete))
-          EOF
-          if [ "${CHANNEL}" == "long-term" ]; then
-              sed -i "s/\"7.20.8\", \"7.21.4\"/\"7.20.8\", \"7.21.4\", \"${VERSION}\"/" update_json.py
-          fi
-          python3 update_json.py "${VERSION}" "${CHANNEL}"
-          
-          rsync -avz --progress -e "ssh -p $SSH_PORT" ./vps_upload/${VERSION} $SSH_USER@$SSH_HOST:$WEB_DIR/
-          rsync -avz --progress -e "ssh -p $SSH_PORT" ./vps_upload/extra $SSH_USER@$SSH_HOST:$WEB_DIR/
-          if [ -f "./vps_upload/NEWESTa7.${CHANNEL}" ]; then
-              rsync -avz --progress -e "ssh -p $SSH_PORT" ./vps_upload/NEWESTa7.${CHANNEL} $SSH_USER@$SSH_HOST:$WEB_DIR/
-          fi
-          rsync -avz --progress -e "ssh -p $SSH_PORT" ./versions.json ./index.html $SSH_USER@$SSH_HOST:$WEB_DIR/
 
       - name: 🗑️ 强制清理旧版本 Release (仅限手动触发)
         if: github.event_name == 'workflow_dispatch'
@@ -648,7 +482,6 @@ jobs:
           TAG_NAME: v${{ env.VERSION }}-${{ env.CHANNEL }}
         run: |
           echo ">>> 检测到为手动触发，准备清理可能存在的冲突 Tag: $TAG_NAME"
-          # 如果存在同名 release 则删除它，--cleanup-tag 连同 tag 一起删掉。如果不存在则报错忽略，保证流水线继续执行
           gh release delete "$TAG_NAME" --cleanup-tag -y || echo "旧 Release 不存在，无需清理，跳过。"
 
       - name: 📦 发布到 GitHub Release
@@ -660,6 +493,7 @@ jobs:
           files: |
             all_packages_arm64_${{ env.VERSION }}_patched.zip
             all_packages_x86_${{ env.VERSION }}_patched.zip
-            vps_upload/extra/${{ env.VERSION }}/*.zip
+            release_files/${VERSION}/routeros-${VERSION}.npk
+            release_files/extra/${{ env.VERSION }}/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
