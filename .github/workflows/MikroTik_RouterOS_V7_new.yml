@@ -279,7 +279,6 @@ jobs:
 
       - name: 获取loader等核心文件
         env:
-          LOADER_URL: 'https://${{ secrets.CUSTOM_UPGRADE_URL }}/routeros/extra/loader.7z'
           LOADER_PWD: ${{ secrets.LOADER_PASSWORD }}
         run: |
           sudo apt-get install -y p7zip-full > /dev/null          
