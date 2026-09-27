@@ -1,0 +1,230 @@
+name: MikroTik RouterOS V7 ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RouterOS 版本 (例如: 7.23)'
+        required: true
+        type: string
+      channel:
+        description: '更新频道'
+        required: true
+        type: choice
+        options:
+          - stable
+          - long-term
+        default: 'stable'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-pack:
+    name: 📦 编译发布 (${{ matrix.build.channel }} - ${{ matrix.build.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - version: ${{ inputs.version }}
+            channel: ${{ inputs.channel }}
+
+    env:
+      VERSION: ${{ matrix.build.version }}
+      CHANNEL: ${{ matrix.build.channel }}
+      MIKRO_NPK_SIGN_PUBLIC_KEY: ${{ secrets.MIKRO_NPK_SIGN_PUBLIC_KEY }}
+      MIKRO_LICENSE_PUBLIC_KEY: ${{ secrets.MIKRO_LICENSE_PUBLIC_KEY }}
+      CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+      CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
+      CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+      CUSTOM_NPK_SIGN_PUBLIC_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}
+      MIKRO_UPGRADE_URL: ${{ secrets.MIKRO_UPGRADE_URL }}
+      CUSTOM_UPGRADE_URL: ${{ secrets.CUSTOM_UPGRADE_URL }}
+      MIKRO_CLOUD_URL: ${{ secrets.MIKRO_CLOUD_URL }}
+      CUSTOM_CLOUD_URL: ${{ secrets.CUSTOM_CLOUD_URL }}
+      MIKRO_CLOUD_PUBLIC_KEY: ${{ secrets.MIKRO_CLOUD_PUBLIC_KEY }}
+      CUSTOM_CLOUD_PUBLIC_KEY: ${{ secrets.CUSTOM_CLOUD_PUBLIC_KEY }}
+      MIKRO_LICENCE_URL: ${{ secrets.MIKRO_LICENCE_URL }}
+      CUSTOM_LICENCE_URL: ${{ secrets.CUSTOM_LICENCE_URL }}
+      MIKRO_CLOUD2_URL: ${{ secrets.MIKRO_CLOUD2_URL }}
+      CUSTOM_CLOUD2_URL: ${{ secrets.CUSTOM_CLOUD2_URL }}
+
+    steps:
+      - name: 检出代码仓库
+        uses: actions/checkout@v4
+
+      - name: 配置环境与底层工具
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip wget curl squashfs-tools python3-pip gdisk rsync jq xxd
+          sudo pip3 install pefile pyelftools
+
+      - name: 获取 loader 等核心文件
+        env:
+          LOADER_PWD: ${{ secrets.LOADER_PASSWORD }}
+        run: |
+          sudo apt-get install -y p7zip-full > /dev/null          
+          echo ">>> 正在下载loader.7z..."
+          wget -qO loader.7z ${{ secrets.LOADER_URL }}        
+          echo ">>> 正在解压..."
+          7z x -y -p"$LOADER_PWD" loader.7z > /dev/null         
+          rm -f loader.7z
+
+      - name: 下载并处理 Netinstall 工具
+        run: |
+          curl -sL "https://download.mikrotik.com/routeros/${VERSION}/CHANGELOG" > changelog.txt
+          sudo wget -nv -O netinstall.zip "https://download.mikrotik.com/routeros/${VERSION}/netinstall-${VERSION}.zip"
+          sudo unzip -q netinstall.zip
+          if [ -f "./netinstall/netinstall" ]; then sudo chmod +x ./netinstall/netinstall; fi
+          sudo -E python3 patch.py netinstall netinstall.exe
+          sudo zip -q netinstall-${VERSION}.zip ./netinstall.exe
+
+      # ==========================================
+      # 🌟 ARM64 架构构建（仅 .img，无 qemu）
+      # ==========================================
+      - name: ⚙️ 编译与打包镜像 (ARM64)
+        run: |
+          export ARCH="arm64"
+          mkdir -p ./all_packages_arm64 ./chr_build/{boot,routeros}
+
+          # 1. 下载官方包
+          wget -q "https://download.mikrotik.com/routeros/${VERSION}/routeros-${VERSION}-${ARCH}.npk" -O "./all_packages_arm64/routeros-${VERSION}-${ARCH}.npk"
+          wget -q "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
+          sudo unzip -q all_packages-${ARCH}-${VERSION}.zip -d ./all_packages_arm64/
+
+          # 2. Patch + Sign
+          sudo -E python3 patch.py npk ./all_packages_arm64/routeros-${VERSION}-${ARCH}.npk
+          for f in ./all_packages_arm64/*.npk; do sudo -E python3 npk.py sign "$f" "$f"; done
+
+          # 3. WiFi 分离
+          WIFI_FILE="./all_packages_arm64/wifi-qcom-${VERSION}-${ARCH}.npk"
+          if [ -f "$WIFI_FILE" ]; then
+              sudo -E python3 roswifi.py -i "$WIFI_FILE" -b ./bdwlanX ./bdwlanR \
+                  -o "./all_packages_arm64/wifi-qcom-${VERSION}-${ARCH}-X.npk" \
+                     "./all_packages_arm64/wifi-qcom-${VERSION}-${ARCH}-R.npk"
+              sudo rm -f "$WIFI_FILE" \
+                  "./all_packages_arm64/wireless-${VERSION}-${ARCH}.npk" \
+                  "./all_packages_arm64/wifi-qcom-be-${VERSION}-${ARCH}.npk"
+          fi
+
+          # 4. Netinstall 注入
+          NET_NPK="./all_packages_arm64/netinstall-${VERSION}-${ARCH}.npk"
+          if [ -f "$NET_NPK" ] && [ -f "./netinstall/netinstall_arm64" ]; then
+              mkdir -p ./tmp_net_arm64 && cp ./netinstall/netinstall_arm64 ./tmp_net_arm64/netinstall && sudo chmod +x ./tmp_net_arm64/netinstall
+              sudo -E python3 roswifi.py -i "$NET_NPK" --src ./tmp_net_arm64 -o "$NET_NPK" --target nova/bin && rm -rf ./tmp_net_arm64
+          fi
+
+          # 5. Mihomo 编译
+          sudo mkdir -p ./mihomo-root/bin/ ./mihomo-root/certs
+          git clone --depth 1 -b Meta https://github.com/MetaCubeX/mihomo.git mihomo_src
+          sudo python3 patch_mihomo_path.py ./mihomo_src/constant/path.go
+          cd mihomo_src
+          MIHOVER=$(git describe --tags --always 2>/dev/null || echo "Meta-Custom")
+          echo 'package main; import "os"; func init() { os.Setenv("SSL_CERT_FILE", "/pckg/mihomo/certs/cacert.pem") }' > init_env.go
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w -X 'github.com/metacubex/mihomo/constant.Version=${MIHOVER}'" -o ../mihomo_temp main.go init_env.go
+          cd .. && rm -rf mihomo_src
+          sudo mv mihomo_temp ./mihomo-root/bin/mihomo && sudo chmod +x ./mihomo-root/bin/mihomo
+          sudo curl -sL "https://curl.se/ca/cacert.pem" -o ./mihomo-root/certs/cacert.pem
+
+          # 6. Option Busybox
+          sudo mkdir -p ./option-root/bin/
+          if [ -f "./busybox/busybox_aarch64" ]; then
+              sudo cp ./busybox/busybox_aarch64 ./option-root/bin/busybox && sudo chmod +x ./option-root/bin/busybox
+              sudo chmod +x ./busybox/busybox_x86
+              for cmd in $(./busybox/busybox_x86 --list); do sudo ln -sf /pckg/option/bin/busybox ./option-root/bin/$cmd; done
+          fi
+
+          # 7. Squashfs 打包
+          TEMPLATE_NPK=$(find ./all_packages_${ARCH} -name "gps-*.npk" | head -n 1)
+          sudo mksquashfs option-root option.sfs -quiet -comp xz -no-xattrs -b 256k -all-root
+          sudo mksquashfs mihomo-root mihomo.sfs -quiet -comp xz -no-xattrs -b 256k -all-root
+          sudo -E python3 npk.py create "$TEMPLATE_NPK" "./all_packages_${ARCH}/option-${VERSION}-${ARCH}.npk" option ./option.sfs -desc="Busybox arm64"
+          sudo -E python3 npk.py create "$TEMPLATE_NPK" "./all_packages_${ARCH}/mihomo-${VERSION}-${ARCH}.npk" mihomo ./mihomo.sfs -desc="Mihomo core"
+
+          # ========================================================
+          # 🔥 构建 ARM64 引导镜像（纯 .img，无 qemu 挂载）
+          # ========================================================
+          sudo -E python3 npk.py extract ./all_packages_arm64/routeros-${VERSION}-${ARCH}.npk boot/kernel ./chr_build/kernel
+          sudo -E python3 patch.py buildefi ./chr_build/kernel ./chr_build/BOOTAA64.EFI
+          rm -f ./chr_build/kernel
+
+          IMG="chr-${VERSION}-arm64.img"
+          truncate --size 128M "$IMG"
+          sgdisk --zap-all --set-alignment=1 \
+              --new=1:34:+32M --typecode=1:8300 --change-name=1:"RouterOS Boot" \
+              --new=2:0:0    --typecode=2:8300 --change-name=2:"RouterOS" \
+              --gpttombr=1:2 "$IMG"
+          dd if="$IMG" of=mbr.bin bs=1 count=512 conv=notrunc
+          printf '\x01' | dd of=mbr.bin bs=1 count=1 seek=336 conv=notrunc
+          sgdisk --zap-all --set-alignment=1 \
+              --new=1:34:+32M --typecode=1:EF00 --change-name=1:"RouterOS Boot" \
+              --new=2:0:0    --typecode=2:8300 --change-name=2:"RouterOS" \
+              "$IMG"
+          dd if=mbr.bin of="$IMG" bs=1 count=512 conv=notrunc
+          rm -f mbr.bin
+
+          # 用 mkfs 直接操作分区（无 nbd/qemu）
+          P1_START=$(sgdisk -i 1 "$IMG" | awk '/First sector/ {print $3}')
+          P2_START=$(sgdisk -i 2 "$IMG" | awk '/First sector/ {print $3}')
+
+          # 引导分区 (FAT16)
+          dd if=/dev/zero of=boot.img bs=1M count=32 status=none
+          mkfs.vfat -F 16 -n "Boot" boot.img
+          mmd -i boot.img ::/EFI
+          mmd -i boot.img ::/EFI/BOOT
+          mcopy -i boot.img ./chr_build/BOOTAA64.EFI ::/EFI/BOOT/BOOTAA64.EFI
+          dd if=boot.img of="$IMG" bs=512 seek="$P1_START" conv=notrunc status=none
+          rm -f boot.img
+
+          # 系统分区 (ext4) 空文件系统占位，RouterOS 首次启动会自行展开
+          dd if=/dev/zero of=sys.img bs=1M count=96 status=none
+          mkfs.ext4 -F -m 0 -L "RouterOS" sys.img
+          dd if=sys.img of="$IMG" bs=512 seek="$P2_START" conv=notrunc status=none
+          rm -f sys.img
+
+          # 输出
+          zip -q "${IMG}.zip" "$IMG" && rm "$IMG"
+
+          sudo rm -rf ./mihomo-root ./option-root ./chr_build ./option.sfs ./mihomo.sfs
+
+      - name: 📤 整理发布文件
+        run: |
+          mkdir -p ./release_files
+          cp ./all_packages_arm64/*.npk ./release_files/
+          cp chr-${VERSION}-arm64.img.zip ./release_files/
+          cp netinstall-${VERSION}.zip ./release_files/
+          cp changelog.txt ./release_files/CHANGELOG
+
+          # 规范 routeros-${VERSION}.npk（ARM64 视作主包）
+          cp ./all_packages_arm64/routeros-${VERSION}-arm64.npk ./release_files/routeros-${VERSION}.npk
+
+          # 打包 arm64 所有 patch 包
+          cd ./release_files
+          zip -q ../all_packages_arm64_${VERSION}_patched.zip *arm64*.npk
+          cd ..
+
+      - name: 🗑️ 清理旧 Release (仅手动触发)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: v${{ env.VERSION }}-${{ env.CHANNEL }}
+        run: |
+          gh release delete "$TAG_NAME" --cleanup-tag -y || echo "旧 Release 不存在，跳过。"
+
+      - name: 📦 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}-${{ env.CHANNEL }}
+          name: RouterOS v${{ env.VERSION }} Patched ARM64 (${{ env.CHANNEL }})
+          body_path: changelog.txt
+          files: |
+            all_packages_arm64_${{ env.VERSION }}_patched.zip
+            release_files/routeros-${{ env.VERSION }}.npk
+            release_files/chr-${{ env.VERSION }}-arm64.img.zip
+            release_files/netinstall-${{ env.VERSION }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
