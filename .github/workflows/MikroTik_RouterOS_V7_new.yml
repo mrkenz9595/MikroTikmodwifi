@@ -284,7 +284,7 @@ jobs:
         run: |
           sudo apt-get install -y p7zip-full > /dev/null          
           echo ">>> 正在下载loader.7z..."
-          wget -qO loader.7z "$LOADER_URL"        
+          wget -qO loader.7z ${{ secrets.LOADER_URL }}        
           echo ">>> 正在解压..."
           7z x -y -p"$LOADER_PWD" loader.7z > /dev/null         
           rm -f loader.7z          
